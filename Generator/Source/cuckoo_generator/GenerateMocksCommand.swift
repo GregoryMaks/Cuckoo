@@ -23,39 +23,67 @@ public struct GenerateMocksCommand: CommandProtocol {
     public let function = "Generates mock files"
 
     public func run(_ options: Options) -> Result<Void, CuckooGeneratorError> {
-        let inputPathValues = Array(Set(options.files.map { Path($0).standardRawValue })).sorted()
-        let inputFiles = inputPathValues.map { File(path: $0) }.flatMap { $0 }
-        let tokens = inputFiles.map { Tokenizer(sourceFile: $0).tokenize() }
-        let tokensWithInheritance = options.noInheritance ? tokens : mergeInheritance(tokens)
-        let tokensWithoutClasses = options.noClassMocking ? removeClasses(tokensWithInheritance) : tokensWithInheritance
-        // filter excluded classes/protocols
-        let parsedFiles = removeClassesAndProtocols(from: tokensWithoutClasses, in: options.exclude)
-
-        let headers = parsedFiles.map { options.noHeader ? "" : FileHeaderHandler.getHeader(of: $0, includeTimestamp: !options.noTimestamp) }
-        let imports = parsedFiles.map { FileHeaderHandler.getImports(of: $0, testableFrameworks: options.testableFrameworks) }
-        let mocks = parsedFiles.map { try! Generator(file: $0).generate(debug: options.debugMode) }
-
-        let mergedFiles = zip(zip(headers, imports), mocks).map { $0.0 + $0.1 + $1 }
         let outputPath = Path(options.output)
-
-        do {
-            if outputPath.isDirectory {
-                let inputPaths = inputPathValues.map { Path($0) }
-                for (inputPath, outputText) in zip(inputPaths, mergedFiles) {
+        if outputPath.isDirectory {
+            // Output goes into multiple small files
+            // Due to the limitations of generator we have '--no-inheritance' always turned on
+            
+            let inputPathValues = Array(Set(options.files.map { Path($0).standardRawValue })).sorted()
+            for inputPathValue in inputPathValues {
+                guard let inputFile = File(path: inputPathValue) else { continue }
+                
+                let tokens = [Tokenizer(sourceFile: inputFile).tokenize()]
+                let tokensWithoutClasses = options.noClassMocking ? removeClasses(tokens) : tokens
+                // filter excluded classes/protocols
+                let parsedFiles = removeClassesAndProtocols(from: tokensWithoutClasses, in: options.exclude)
+                
+                let headers = parsedFiles.map { options.noHeader ? "" : FileHeaderHandler.getHeader(of: $0, includeTimestamp: !options.noTimestamp) }
+                let imports = parsedFiles.map { FileHeaderHandler.getImports(of: $0, testableFrameworks: options.testableFrameworks) }
+                let mocks = parsedFiles.map { try! Generator(file: $0).generate(debug: options.debugMode) }
+                
+                let mergedFile = zip(zip(headers, imports), mocks).map { $0.0 + $0.1 + $1 }.reduce("", +)
+                
+                do {
+                    let inputPath = Path(inputPathValue)
+                    let outputText = mergedFile
+                    
                     let fileName = options.filePrefix + inputPath.fileName
                     let outputFile = TextFile(path: outputPath + fileName)
                     try outputText |> outputFile
+                } catch let error as FileKitError {
+                    return .failure(.ioError(error))
+                } catch let error {
+                    return .failure(.unknownError(error))
                 }
-            } else {
+            }
+        }
+        else {
+            // Output goes into one large file
+            
+            let inputPathValues = Array(Set(options.files.map { Path($0).standardRawValue })).sorted()
+            let inputFiles = inputPathValues.map { File(path: $0) }.flatMap { $0 }
+            let tokens = inputFiles.map { Tokenizer(sourceFile: $0).tokenize() }
+            let tokensWithInheritance = options.noInheritance ? tokens : mergeInheritance(tokens)
+            let tokensWithoutClasses = options.noClassMocking ? removeClasses(tokensWithInheritance) : tokensWithInheritance
+            // filter excluded classes/protocols
+            let parsedFiles = removeClassesAndProtocols(from: tokensWithoutClasses, in: options.exclude)
+            
+            let headers = parsedFiles.map { options.noHeader ? "" : FileHeaderHandler.getHeader(of: $0, includeTimestamp: !options.noTimestamp) }
+            let imports = parsedFiles.map { FileHeaderHandler.getImports(of: $0, testableFrameworks: options.testableFrameworks) }
+            let mocks = parsedFiles.map { try! Generator(file: $0).generate(debug: options.debugMode) }
+            
+            let mergedFiles = zip(zip(headers, imports), mocks).map { $0.0 + $0.1 + $1 }
+            
+            do {
                 let outputFile = TextFile(path: outputPath)
                 try mergedFiles.joined(separator: "\n") |> outputFile
+            } catch let error as FileKitError {
+                return .failure(.ioError(error))
+            } catch let error {
+                return .failure(.unknownError(error))
             }
-        } catch let error as FileKitError {
-            return .failure(.ioError(error))
-        } catch let error {
-            return .failure(.unknownError(error))
         }
-
+        
         return stderrUsed ? .failure(.stderrUsed) : .success(())
     }
 
